@@ -1,0 +1,104 @@
+# -*- coding: utf-8 -*-
+"""
+Source-sink analysis of functional zones by mode and hour.
+
+Input file:
+  outputs/all_od_function.pkl
+
+Output files:
+  outputs/figures/source_sink/Functional_Zone_{zone_id}_source_sink.png
+  outputs/figures/figure6_source_sink_summary.png
+"""
+
+from pathlib import Path
+import pickle
+import warnings
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+BASE_DIR = Path(".")
+OUTPUT_DIR = BASE_DIR / "outputs"
+FIGURE_DIR = OUTPUT_DIR / "figures"
+SOURCE_SINK_DIR = FIGURE_DIR / "source_sink"
+OD_WITH_FUNCTION_PATH = OUTPUT_DIR / "all_od_function.pkl"
+
+MODE_COLORS = {"Bike": "#2E8B57", "Bus": "#FFD700", "Subway": "#DC143C", "Taxi": "#1E90FF"}
+
+
+def load_od() -> pd.DataFrame:
+    with OD_WITH_FUNCTION_PATH.open("rb") as f:
+        od = pickle.load(f)
+    od["Shour"] = pd.to_numeric(od["Shour"], errors="coerce")
+    return od.dropna(subset=["Shour", "O_k6", "D_k6", "mode"])
+
+
+def source_sink_series(od: pd.DataFrame, zone_id: int, mode: str, threshold: int = 100) -> pd.Series:
+    mode_df = od[od["mode"] == mode].copy()
+    mode_df["time_bin"] = pd.cut(mode_df["Shour"], bins=list(range(25)), labels=range(24), right=False, include_lowest=True)
+    origins = mode_df[mode_df["O_k6"] == zone_id].groupby("time_bin").size().reindex(range(24), fill_value=0)
+    destinations = mode_df[mode_df["D_k6"] == zone_id].groupby("time_bin").size().reindex(range(24), fill_value=0)
+    denominator = origins + destinations
+    value = np.where(denominator > threshold, (destinations - origins) / denominator * 100, 0)
+    return pd.Series(value, index=np.arange(0.5, 24.5, 1.0))
+
+
+def plot_zone_curves(od: pd.DataFrame) -> None:
+    SOURCE_SINK_DIR.mkdir(parents=True, exist_ok=True)
+    zones = sorted(set(od["O_k6"].dropna().astype(int)).union(set(od["D_k6"].dropna().astype(int))))
+    zones = [z for z in zones if 0 <= z <= 5]
+
+    for idx, zone_id in enumerate(zones):
+        fig, ax = plt.subplots(figsize=(10, 5.8), dpi=300)
+        for mode, color in MODE_COLORS.items():
+            series = source_sink_series(od, zone_id, mode)
+            ax.plot(series.index, series.values, color=color, marker="s", linewidth=2, label=mode)
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_xlim(0, 24)
+        ax.set_ylim(-50, 50)
+        ax.set_xlabel("Hour")
+        ax.set_ylabel("Net inflow rate (%)")
+        ax.set_title(f"Functional Zone {zone_id}")
+        ax.grid(True, alpha=0.3, linestyle="--")
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        fig.savefig(SOURCE_SINK_DIR / f"Functional_Zone_{zone_id}_source_sink.png", dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+
+def plot_summary(od: pd.DataFrame) -> None:
+    zones = sorted(set(od["O_k6"].dropna().astype(int)).union(set(od["D_k6"].dropna().astype(int))))
+    zones = [z for z in zones if 0 <= z <= 5]
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), dpi=300)
+    axes = axes.flatten()
+
+    for idx, zone_id in enumerate(zones[:6]):
+        ax = axes[idx]
+        for mode, color in MODE_COLORS.items():
+            series = source_sink_series(od, zone_id, mode)
+            ax.plot(series.index, series.values, color=color, marker="s", linewidth=1.8, label=mode)
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_xlim(0, 24)
+        ax.set_ylim(-50, 50)
+        ax.set_title(f"Zone {zone_id}")
+        ax.grid(True, alpha=0.3, linestyle="--")
+        if idx == 0:
+            ax.legend(frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(FIGURE_DIR / "figure6_source_sink_summary.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def main() -> None:
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+    od = load_od()
+    plot_zone_curves(od)
+    plot_summary(od)
+
+
+if __name__ == "__main__":
+    main()
