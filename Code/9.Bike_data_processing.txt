@@ -1,0 +1,144 @@
+# -*- coding: utf-8 -*-
+"""
+Clean shared-bike trajectory records and convert consecutive bicycle observations into trip records.
+
+Input files:
+  data/transport_raw/bike/*.csv
+  data/study_area_boundary/beijing_central_area.shp  (optional, for endpoint filtering)
+
+Output file:
+  outputs/transport/bike_trips.csv
+"""
+
+from datetime import timedelta
+from pathlib import Path
+import glob
+import math
+import warnings
+
+import geopandas as gpd
+import pandas as pd
+from shapely.geometry import Point
+
+warnings.filterwarnings("ignore")
+
+BASE_DIR = Path(".")
+RAW_BIKE_DIR = BASE_DIR / "data" / "transport_raw" / "bike"
+BOUNDARY_PATH = BASE_DIR / "data" / "study_area_boundary" / "beijing_central_area.shp"
+OUTPUT_DIR = BASE_DIR / "outputs" / "transport"
+OUTPUT_PATH = OUTPUT_DIR / "bike_trips.csv"
+
+INPUT_CRS = "EPSG:4326"
+PROJECT_CRS = "EPSG:4527"
+
+
+def parse_bike_datetime(value):
+    text = str(value)
+    if text.endswith("24:00"):
+        try:
+            base = pd.to_datetime(text.split(" ")[0], format="%Y/%m/%d")
+            return base + timedelta(days=1)
+        except Exception:
+            return pd.NaT
+    return pd.to_datetime(text, format="%Y/%m/%d %H:%M", errors="coerce")
+
+
+def haversine_distance_m(lat1, lon1, lat2, lon2):
+    radius_m = 6378137.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * radius_m * math.asin(math.sqrt(a))
+
+
+def load_raw_bike_records(raw_dir: Path) -> pd.DataFrame:
+    csv_files = sorted(glob.glob(str(raw_dir / "*.csv")))
+    if not csv_files:
+        raise FileNotFoundError(f"No shared-bike CSV files found in {raw_dir}")
+
+    frames = [pd.read_csv(file, header=None) for file in csv_files]
+    data = pd.concat(frames, ignore_index=True)
+    data.columns = ["datetime", "bike_id", "lon", "lat"]
+    data["datetime"] = data["datetime"].apply(parse_bike_datetime)
+    data = data.dropna(subset=["bike_id", "datetime", "lon", "lat"])
+    return data
+
+
+def build_bike_trips(records: pd.DataFrame) -> pd.DataFrame:
+    data = records.sort_values(["bike_id", "datetime"]).drop_duplicates(
+        subset=["bike_id", "lon", "lat", "datetime"],
+        keep="first",
+    )
+    data = data.drop_duplicates(subset=["bike_id", "lon", "lat"], keep="first")
+
+    previous = data.groupby("bike_id")[["datetime", "lon", "lat"]].shift(1)
+    trips = data.assign(
+        Stime=previous["datetime"],
+        O_lon=previous["lon"],
+        O_lat=previous["lat"],
+        Etime=data["datetime"],
+        D_lon=data["lon"],
+        D_lat=data["lat"],
+    ).dropna(subset=["Stime", "O_lon", "O_lat", "Etime", "D_lon", "D_lat"])
+
+    trips["distance_m"] = trips.apply(
+        lambda row: haversine_distance_m(row["O_lat"], row["O_lon"], row["D_lat"], row["D_lon"]),
+        axis=1,
+    )
+    trips["duration_min"] = (trips["Etime"] - trips["Stime"]).dt.total_seconds() / 60
+    trips = trips[(trips["distance_m"].between(100, 15000)) & (trips["duration_min"].between(0, 120))]
+    trips = trips.sort_values(["bike_id", "Stime"]).reset_index(drop=True)
+    trips["orderid"] = trips.groupby("bike_id").cumcount() + 1
+    trips["mode"] = "Bike"
+
+    return trips[
+        [
+            "bike_id",
+            "orderid",
+            "mode",
+            "Stime",
+            "Etime",
+            "O_lon",
+            "O_lat",
+            "D_lon",
+            "D_lat",
+            "distance_m",
+            "duration_min",
+        ]
+    ]
+
+
+def filter_trip_endpoints_by_boundary(trips: pd.DataFrame, boundary_path: Path) -> pd.DataFrame:
+    if not boundary_path.exists():
+        return trips
+
+    boundary = gpd.read_file(boundary_path).to_crs(PROJECT_CRS)
+    region = boundary.geometry.unary_union
+
+    origin = gpd.GeoDataFrame(
+        trips,
+        geometry=[Point(xy) for xy in zip(trips["O_lon"], trips["O_lat"])],
+        crs=INPUT_CRS,
+    ).to_crs(PROJECT_CRS)
+    destination = gpd.GeoDataFrame(
+        trips,
+        geometry=[Point(xy) for xy in zip(trips["D_lon"], trips["D_lat"])],
+        crs=INPUT_CRS,
+    ).to_crs(PROJECT_CRS)
+
+    keep = origin.geometry.within(region) & destination.geometry.within(region)
+    return trips.loc[keep.values].copy()
+
+
+def main() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    records = load_raw_bike_records(RAW_BIKE_DIR)
+    trips = build_bike_trips(records)
+    trips = filter_trip_endpoints_by_boundary(trips, BOUNDARY_PATH)
+    trips.to_csv(OUTPUT_PATH, index=False, encoding="utf_8_sig")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2 @@
+# Store released data files with Git LFS.
+Data/** filter=lfs diff=lfs merge=lfs -text

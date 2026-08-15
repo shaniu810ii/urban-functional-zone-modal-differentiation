@@ -1,0 +1,196 @@
+# -*- coding: utf-8 -*-
+"""
+Convert raw taxi GPS/status logs into standardized taxi trip records.
+
+Input files:
+  data/transport_raw/taxi/*.txt
+  data/study_area_boundary/beijing_central_area.shp  (optional, for endpoint filtering)
+
+Output file:
+  outputs/transport/taxi_trips.csv
+"""
+
+from pathlib import Path
+import glob
+import warnings
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+from shapely.geometry import Point
+
+warnings.filterwarnings("ignore")
+
+BASE_DIR = Path(".")
+RAW_TAXI_DIR = BASE_DIR / "data" / "transport_raw" / "taxi"
+BOUNDARY_PATH = BASE_DIR / "data" / "study_area_boundary" / "beijing_central_area.shp"
+OUTPUT_DIR = BASE_DIR / "outputs" / "transport"
+OUTPUT_PATH = OUTPUT_DIR / "taxi_trips.csv"
+
+INPUT_CRS = "EPSG:4326"
+PROJECT_CRS = "EPSG:4527"
+
+
+def vectorized_haversine_m(slats, slons, elats, elons):
+    radius_m = 6371000.0
+    phi1 = np.radians(slats)
+    phi2 = np.radians(elats)
+    dphi = np.radians(elats - slats)
+    dlambda = np.radians(elons - slons)
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2) ** 2
+    return 2 * radius_m * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+
+def load_raw_taxi_logs(raw_dir: Path) -> pd.DataFrame:
+    txt_files = sorted(glob.glob(str(raw_dir / "*.txt")))
+    if not txt_files:
+        raise FileNotFoundError(f"No taxi log files found in {raw_dir}")
+
+    frames = [pd.read_csv(file, header=None) for file in txt_files]
+    data = pd.concat(frames, ignore_index=True)
+    data.columns = [
+        "date",
+        "timestamp",
+        "company",
+        "carid",
+        "lon",
+        "lat",
+        "speed",
+        "angle",
+        "status",
+        "temp",
+        "datetime",
+    ]
+    data = data[["carid", "datetime", "lon", "lat", "speed", "status"]].copy()
+    data["datetime"] = pd.to_datetime(data["datetime"].astype(str).str.rstrip(";"), errors="coerce")
+    data = data.dropna(subset=["carid", "datetime", "lon", "lat", "speed", "status"])
+    return data
+
+
+def filter_points_by_boundary(records: pd.DataFrame, boundary_path: Path) -> pd.DataFrame:
+    if not boundary_path.exists():
+        return records
+
+    boundary = gpd.read_file(boundary_path).to_crs(INPUT_CRS)
+    xmin, ymin, xmax, ymax = boundary.total_bounds
+    return records[records["lon"].between(xmin, xmax) & records["lat"].between(ymin, ymax)].copy()
+
+
+def clean_taxi_logs(records: pd.DataFrame) -> pd.DataFrame:
+    data = records.copy()
+    data["status"] = np.where(data["status"] != 0, 1, 0)
+    data = data.drop_duplicates().sort_values(["carid", "datetime"]).reset_index(drop=True)
+    data = data[data["speed"] <= 140].copy()
+
+    spike = (
+        (data["status"].shift() == data["status"].shift(-1))
+        & (data["status"] != data["status"].shift(-1))
+        & (data["carid"] == data["carid"].shift(-1))
+        & (data["carid"] == data["carid"].shift())
+    )
+    return data.loc[~spike].copy()
+
+
+def build_taxi_segments(records: pd.DataFrame) -> pd.DataFrame:
+    current = records.copy()
+    next_values = current.groupby("carid")[["datetime", "lon", "lat", "speed", "status"]].shift(-1)
+    segments = current.assign(
+        Etime=next_values["datetime"],
+        Elng=next_values["lon"],
+        Elat=next_values["lat"],
+        Speed1=next_values["speed"],
+        Status1=next_values["status"],
+    ).dropna(subset=["Etime", "Elng", "Elat", "Status1"])
+
+    segments = segments.rename(columns={"datetime": "Stime", "lon": "Slng", "lat": "Slat", "speed": "Speed", "status": "Status"})
+    segments["StatusChange"] = segments["Status1"] - segments["Status"]
+    segments["neworder"] = (segments["StatusChange"] == 1).astype(int)
+    segments["orderid"] = segments.groupby("carid")["neworder"].cumsum()
+    segments["duration_s"] = (segments["Etime"] - segments["Stime"]).dt.total_seconds()
+    segments["distance_m"] = vectorized_haversine_m(
+        segments["Slat"].values,
+        segments["Slng"].values,
+        segments["Elat"].values,
+        segments["Elng"].values,
+    )
+    return segments[(segments["duration_s"] > 0) & (segments["orderid"] > 0)].copy()
+
+
+def aggregate_taxi_orders(segments: pd.DataFrame) -> pd.DataFrame:
+    occupied = segments[segments["Status1"] == 1].copy()
+    grouped = occupied.groupby(["carid", "orderid"], as_index=False)
+
+    order_time = grouped.agg(Stime=("Stime", "min"), Etime=("Etime", "max"))
+    distance = grouped.agg(distance_m=("distance_m", "sum"))
+    duration = grouped.agg(duration_s=("duration_s", "sum"))
+
+    start_points = (
+        occupied.sort_values("Stime")
+        .drop_duplicates(subset=["carid", "orderid"], keep="first")[["carid", "orderid", "Slng", "Slat"]]
+        .rename(columns={"Slng": "O_lon", "Slat": "O_lat"})
+    )
+    end_points = (
+        occupied.sort_values("Etime", ascending=False)
+        .drop_duplicates(subset=["carid", "orderid"], keep="first")[["carid", "orderid", "Elng", "Elat"]]
+        .rename(columns={"Elng": "D_lon", "Elat": "D_lat"})
+    )
+
+    trips = order_time.merge(distance, on=["carid", "orderid"]).merge(duration, on=["carid", "orderid"])
+    trips = trips.merge(start_points, on=["carid", "orderid"], how="left").merge(end_points, on=["carid", "orderid"], how="left")
+    trips["duration_min"] = trips["duration_s"] / 60
+    trips["speed_kmh"] = trips["distance_m"] * 3.6 / trips["duration_s"]
+    trips = trips[trips["speed_kmh"].between(10, 120)].copy()
+    trips = trips.sort_values(["carid", "Stime"]).reset_index(drop=True)
+    trips["orderid"] = trips.groupby("carid").cumcount() + 1
+    trips["mode"] = "Taxi"
+    return trips[
+        [
+            "carid",
+            "orderid",
+            "mode",
+            "Stime",
+            "Etime",
+            "O_lon",
+            "O_lat",
+            "D_lon",
+            "D_lat",
+            "distance_m",
+            "duration_min",
+            "speed_kmh",
+        ]
+    ]
+
+
+def filter_trip_endpoints_by_boundary(trips: pd.DataFrame, boundary_path: Path) -> pd.DataFrame:
+    if not boundary_path.exists():
+        return trips
+
+    boundary = gpd.read_file(boundary_path).to_crs(PROJECT_CRS)
+    region = boundary.geometry.unary_union
+    origin = gpd.GeoDataFrame(
+        trips,
+        geometry=[Point(xy) for xy in zip(trips["O_lon"], trips["O_lat"])],
+        crs=INPUT_CRS,
+    ).to_crs(PROJECT_CRS)
+    destination = gpd.GeoDataFrame(
+        trips,
+        geometry=[Point(xy) for xy in zip(trips["D_lon"], trips["D_lat"])],
+        crs=INPUT_CRS,
+    ).to_crs(PROJECT_CRS)
+    keep = origin.geometry.within(region) & destination.geometry.within(region)
+    return trips.loc[keep.values].copy()
+
+
+def main() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    logs = load_raw_taxi_logs(RAW_TAXI_DIR)
+    logs = filter_points_by_boundary(logs, BOUNDARY_PATH)
+    clean_logs = clean_taxi_logs(logs)
+    segments = build_taxi_segments(clean_logs)
+    trips = aggregate_taxi_orders(segments)
+    trips = filter_trip_endpoints_by_boundary(trips, BOUNDARY_PATH)
+    trips.to_csv(OUTPUT_PATH, index=False, encoding="utf_8_sig")
+
+
+if __name__ == "__main__":
+    main()
